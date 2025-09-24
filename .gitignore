@@ -5,6 +5,8 @@
 
 video-player/lib/
 video-player/include/
+*.mp4
+
 
 # User-specific files
 *.rsuser
