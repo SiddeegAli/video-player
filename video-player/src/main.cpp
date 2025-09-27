@@ -15,6 +15,8 @@ unsigned int Y_txt;
 unsigned int U_txt;
 unsigned int V_txt;
 
+unsigned int VAO;
+
 const char* vertexShaderSource = R"(
 #version 330 core
 layout (location = 0) in vec2 aPos;
@@ -148,6 +150,39 @@ void setupYUVTextures() {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, v_frame_width / 2, v_frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
 }
 
+// Quad setup (normalized device coordinates from -1 to 1) - UNCHANGED
+void setupQuad() {
+    // Vertices for a full-screen quad and corresponding texture coordinates
+    float vertices[] = {
+        // positions        // texture coords (inverted Y-axis) #Opengl expects the texture to be upside down so thats why we flip the txt cords
+        -1.0f,  1.0f,       0.0f, 0.0f, // Top Left
+        -1.0f, -1.0f,       0.0f, 1.0f, // Bottom Left
+         1.0f, -1.0f,       1.0f, 1.0f, // Bottom Right
+
+        -1.0f,  1.0f,       0.0f, 0.0f, // Top Left
+         1.0f, -1.0f,       1.0f, 1.0f, // Bottom Right
+         1.0f,  1.0f,       1.0f, 0.0f  // Top Right
+    };
+
+    GLuint VBO;
+    glGenVertexArrays(1, &VAO);
+    glGenBuffers(1, &VBO);
+
+    glBindVertexArray(VAO);
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, 24 * sizeof(float), vertices, GL_STATIC_DRAW);
+
+    // Position attribute
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    // Texture coordinate attribute
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0); // Unbind VAO
+}
+
 int main() {
 	fprintf(stdout , "FFmpeg C++ Video Player\n");
 
@@ -196,6 +231,14 @@ int main() {
     }
 
     setupYUVTextures();
+    setupQuad();
+
+    // Set texture uniform locations once
+    glUseProgram(shader_program);
+    glUniform1i(glGetUniformLocation(shader_program, "Y_tex"), 0); // Texture unit 0
+    glUniform1i(glGetUniformLocation(shader_program, "U_tex"), 1); // Texture unit 1
+    glUniform1i(glGetUniformLocation(shader_program, "V_tex"), 2); // Texture unit 2
+
 
 	while (!glfwWindowShouldClose(window)) {
 
