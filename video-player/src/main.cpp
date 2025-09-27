@@ -11,6 +11,10 @@ int decode_video_frame(const char* file_name, AVFrame** out_video_frame);
 int v_frame_width;
 int v_frame_height;
 
+unsigned int Y_txt;
+unsigned int U_txt;
+unsigned int V_txt;
+
 const char* vertexShaderSource = R"(
 #version 330 core
 layout (location = 0) in vec2 aPos;
@@ -110,6 +114,40 @@ unsigned int createShaderProgram(const char* vs, const char* fs) {
     return program;
 }
 
+void setupYUVTextures() {
+    glGenTextures(1, &Y_txt);
+    glGenTextures(1, &U_txt);
+    glGenTextures(1, &V_txt);
+
+    // --- Y Plane (Full Resolution) ---
+    glBindTexture(GL_TEXTURE_2D, Y_txt);
+    // Texture parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // Allocate memory for Y plane (GL_R8 for monochromatic data)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, v_frame_width, v_frame_height, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+
+    // --- U Plane (Half Resolution) ---
+    glBindTexture(GL_TEXTURE_2D, U_txt);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // Allocate memory for U plane
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, v_frame_width / 2, v_frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+
+    // --- V Plane (Half Resolution) ---
+    glBindTexture(GL_TEXTURE_2D, V_txt);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // Allocate memory for V plane
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, v_frame_width / 2, v_frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+}
+
 int main() {
 	fprintf(stdout , "FFmpeg C++ Video Player\n");
 
@@ -156,6 +194,8 @@ int main() {
         fprintf(stderr, "Couldent create a program");
         return -1;
     }
+
+    setupYUVTextures();
 
 	while (!glfwWindowShouldClose(window)) {
 
