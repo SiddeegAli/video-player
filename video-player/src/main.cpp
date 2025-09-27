@@ -15,6 +15,7 @@ unsigned int Y_txt;
 unsigned int U_txt;
 unsigned int V_txt;
 
+unsigned int shader_program;
 unsigned int VAO;
 
 const char* vertexShaderSource = R"(
@@ -183,6 +184,63 @@ void setupQuad() {
     glBindVertexArray(0); // Unbind VAO
 }
 
+// Function to update the texture data using the FFmpeg AVFrame structure
+// This is the CRITICAL integration point, handling FFmpeg's linesize.
+void updateYUVTexturesFromAVFrame(AVFrame* frame) {
+    if (!frame || frame->format != AV_PIX_FMT_YUV420P) {
+        fprintf(stderr, "Error: Invalid or non-YUV420P frame provided.");
+        return;
+    }
+
+    // Set GL_UNPACK_ALIGNMENT to 1 byte, as FFmpeg data is usually tightly packed by row
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    // The key is using glPixelStorei(GL_UNPACK_ROW_LENGTH, frame->linesize[i])
+    // This tells OpenGL that each row of source data is padded (has a stride) equal to linesize.
+
+    // 1. Update Y Plane
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, Y_txt);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, frame->linesize[0]); // Padded source row length
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame->width, frame->height, GL_RED, GL_UNSIGNED_BYTE, frame->data[0]);
+
+    // 2. Update U Plane
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, U_txt);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, frame->linesize[1]);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame->width / 2, frame->height / 2, GL_RED, GL_UNSIGNED_BYTE, frame->data[1]);
+
+    // 3. Update V Plane
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, V_txt);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, frame->linesize[2]);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame->width / 2, frame->height / 2, GL_RED, GL_UNSIGNED_BYTE, frame->data[2]);
+
+    // Reset UNPACK_ROW_LENGTH to zero for standard behavior
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+}
+
+void render() {
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(shader_program);
+
+    // Bind all three texture units
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, Y_txt);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, U_txt);
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, V_txt);
+
+    // Draw the quad
+    glBindVertexArray(VAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
 int main() {
 	fprintf(stdout , "FFmpeg C++ Video Player\n");
 
@@ -223,7 +281,7 @@ int main() {
 	glfwSetFramebufferSizeCallback(window, [](GLFWwindow* w, int width, int height) { glViewport(0, 0, width, height); });
 
     //Createing a shader to render the frame using
-	unsigned int shader_program = createShaderProgram(vertexShaderSource, fragmentShaderSource);
+	shader_program = createShaderProgram(vertexShaderSource, fragmentShaderSource);
 
     if (shader_program == 0) {
         fprintf(stderr, "Couldent create a program");
@@ -242,9 +300,9 @@ int main() {
 
 	while (!glfwWindowShouldClose(window)) {
 
-		glClear(GL_COLOR_BUFFER_BIT);
-
-		glClearColor(1.0f, 1.0f, 0.0f, 1.0f);
+        //now all that is left is to start decodeing new frames
+        updateYUVTexturesFromAVFrame(video_frame);
+        render();
 
 		glfwSwapBuffers(window);
 		glfwPollEvents();
