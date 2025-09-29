@@ -2,10 +2,10 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <thread>
+#include <string.h> // **NEW: For memcpy in PBO update**
 extern "C" {
 #include<libavformat/avformat.h>
 #include <chrono>
-
 }
 
 // Declaring the functions that are in decode_video
@@ -25,7 +25,22 @@ unsigned int V_txt;
 unsigned int shader_program;
 unsigned int VAO;
 
-// ... (vertexShaderSource and fragmentShaderSource remain unchanged) ...
+// **NEW:** PBO IDs for ping-pong: 2 buffers per plane (Y, U, V)
+unsigned int Y_pbo_ids[2];
+unsigned int U_pbo_ids[2];
+unsigned int V_pbo_ids[2];
+
+// **NEW:** Index to track which PBO to use for the current frame
+int pbo_index = 0;
+
+// **NEW:** Function for robust OpenGL Error Checking
+void checkGLError(const char* func) {
+    GLenum err;
+    while ((err = glGetError()) != GL_NO_ERROR) {
+        // Log the error with the function that caused it
+        fprintf(stderr, "OpenGL Error (after %s): %d\n", func, err);
+    }
+}
 
 const char* vertexShaderSource = R"(
 #version 330 core
@@ -74,7 +89,15 @@ void main()
 )";
 
 
-// ... (compileShader, createShaderProgram, setupYUVTextures, setupQuad, and updateYUVTexturesFromAVFrame remain unchanged) ...
+void cleanup_pbo() {
+    // Only delete buffers if they were generated (Y_pbo_ids[0] will be > 0)
+    if (Y_pbo_ids[0] != 0) {
+        glDeleteBuffers(2, Y_pbo_ids);
+        glDeleteBuffers(2, U_pbo_ids);
+        glDeleteBuffers(2, V_pbo_ids);
+        checkGLError("glDeleteBuffers (PBO)");
+    }
+}
 
 unsigned int compileShader(int type, const char* source) {
     //Createing and compileing the shader
@@ -126,39 +149,63 @@ unsigned int createShaderProgram(const char* vs, const char* fs) {
 }
 
 void setupYUVTextures() {
+    // 1. TEXTURE ALLOCATION (Your existing code)
     glGenTextures(1, &Y_txt);
     glGenTextures(1, &U_txt);
     glGenTextures(1, &V_txt);
+    checkGLError("glGenTextures"); // Check for texture generation errors
 
-    // --- Y Plane (Full Resolution) ---
+    // Y Plane (Full Resolution)
     glBindTexture(GL_TEXTURE_2D, Y_txt);
-    // Texture parameters
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    // Allocate memory for Y plane (GL_R8 for monochromatic data)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, v_frame_width, v_frame_height, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
 
-    // --- U Plane (Half Resolution) ---
+    // U Plane (Half Resolution)
     glBindTexture(GL_TEXTURE_2D, U_txt);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    // Allocate memory for U plane
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, v_frame_width / 2, v_frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
 
-    // --- V Plane (Half Resolution) ---
+    // V Plane (Half Resolution)
     glBindTexture(GL_TEXTURE_2D, V_txt);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    // Allocate memory for V plane
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, v_frame_width / 2, v_frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
-}
+    checkGLError("glTexImage2D (Textures)");
 
+    // 2. PBO ALLOCATION (Staging Buffers for DMA)
+    glGenBuffers(2, Y_pbo_ids);
+    glGenBuffers(2, U_pbo_ids);
+    glGenBuffers(2, V_pbo_ids);
+    checkGLError("glGenBuffers (PBOs)");
+
+    int y_size = v_frame_width * v_frame_height;
+    int uv_size = (v_frame_width / 2) * (v_frame_height / 2);
+
+    // Allocate storage for all 6 PBOs (ping-pong)
+    for (int i = 0; i < 2; ++i) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, Y_pbo_ids[i]);
+        // GL_STREAM_DRAW: hint that the data is updated frequently
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, y_size, NULL, GL_STREAM_DRAW);
+
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, U_pbo_ids[i]);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, uv_size, NULL, GL_STREAM_DRAW);
+
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, V_pbo_ids[i]);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, uv_size, NULL, GL_STREAM_DRAW);
+    }
+    checkGLError("glBufferData (PBOs Allocation)");
+
+    // Unbind the PBO
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
 // Quad setup (normalized device coordinates from -1 to 1) - UNCHANGED
 void setupQuad() {
     // Vertices for a full-screen quad and corresponding texture coordinates
@@ -196,38 +243,106 @@ void setupQuad() {
 // This is the CRITICAL integration point, handling FFmpeg's linesize.
 void updateYUVTexturesFromAVFrame(AVFrame* frame) {
     if (!frame || frame->format != AV_PIX_FMT_YUV420P) {
-        fprintf(stderr, "Error: Invalid or non-YUV420P frame provided.");
+        fprintf(stderr, "Error: Invalid or non-YUV420P frame provided. Skipping update.\n");
         return;
     }
 
-    // Set GL_UNPACK_ALIGNMENT to 1 byte, as FFmpeg data is usually tightly packed by row
+    // next_pbo: the buffer we will WRITE to (CPU's target)
+    int next_pbo = pbo_index;
+    // current_pbo: the buffer the GPU will READ from (from the previous frame)
+    int current_pbo = (pbo_index + 1) % 2;
+
+    // Set GL_UNPACK_ALIGNMENT to 1 byte
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-    // The key is using glPixelStorei(GL_UNPACK_ROW_LENGTH, frame->linesize[i])
-    // This tells OpenGL that each row of source data is padded (has a stride) equal to linesize.
+    // --- PHASE 1: ASYNCHRONOUS DATA COPY (CPU -> PBO) ---
+    // The CPU writes the new frame data into the 'next_pbo'
+    int uv_size = (frame->width / 2) * (frame->height / 2);
+
+
+    // 1. Y Plane Copy
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, Y_pbo_ids[next_pbo]);
+    // Use GL_MAP_UNSYNCHRONIZED_BIT for maximum CPU performance; ping-pong ensures safety.
+    GLubyte* ptr_y = (GLubyte*)glMapBufferRange(GL_PIXEL_UNPACK_BUFFER,
+        0,
+        frame->width * frame->height,
+        GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+
+    if (!ptr_y) {
+        fprintf(stderr, "FATAL: glMapBufferRange failed for Y plane. Skipping frame.\n");
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        return;
+    }
+
+    // Copy data row by row, respecting FFmpeg's linesize
+    for (int i = 0; i < frame->height; i++) {
+        memcpy(ptr_y + i * frame->width, frame->data[0] + i * frame->linesize[0], frame->width);
+    }
+    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+
+    // 2. U Plane Copy
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, U_pbo_ids[next_pbo]);
+    GLubyte* ptr_u = (GLubyte*)glMapBufferRange(GL_PIXEL_UNPACK_BUFFER,
+        0,
+        uv_size,
+        GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+    if (!ptr_u) {
+        fprintf(stderr, "FATAL: glMapBufferRange failed for U plane. Skipping frame.\n");
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        return;
+    }
+    for (int i = 0; i < frame->height / 2; i++) {
+        memcpy(ptr_u + i * (frame->width / 2), frame->data[1] + i * frame->linesize[1], frame->width / 2);
+    }
+    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+
+    // 3. V Plane Copy
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, V_pbo_ids[next_pbo]);
+    GLubyte* ptr_v = (GLubyte*)glMapBufferRange(GL_PIXEL_UNPACK_BUFFER,
+        0,
+        uv_size,
+        GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+    if (!ptr_v) {
+        fprintf(stderr, "FATAL: glMapBufferRange failed for V plane. Skipping frame.\n");
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        return;
+    }
+    for (int i = 0; i < frame->height / 2; i++) {
+        memcpy(ptr_v + i * (frame->width / 2), frame->data[2] + i * frame->linesize[2], frame->width / 2);
+    }
+    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+    checkGLError("glMapBufferRange/glUnmapBuffer");
+
+
+    // --- PHASE 2: ASYNCHRONOUS TEXTURE TRANSFER (GPU Reads) ---
+    // The GPU is told to start reading data from the previous frame's PBO (current_pbo)
 
     // 1. Update Y Plane
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, Y_txt);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, frame->linesize[0]); // Padded source row length
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame->width, frame->height, GL_RED, GL_UNSIGNED_BYTE, frame->data[0]);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, Y_pbo_ids[current_pbo]);
+    // The NULL pointer (0) signals OpenGL to use the bound GL_PIXEL_UNPACK_BUFFER
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame->width, frame->height, GL_RED, GL_UNSIGNED_BYTE, 0);
 
     // 2. Update U Plane
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, U_txt);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, frame->linesize[1]);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame->width / 2, frame->height / 2, GL_RED, GL_UNSIGNED_BYTE, frame->data[1]);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, U_pbo_ids[current_pbo]);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame->width / 2, frame->height / 2, GL_RED, GL_UNSIGNED_BYTE, 0);
 
     // 3. Update V Plane
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, V_txt);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, frame->linesize[2]);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame->width / 2, frame->height / 2, GL_RED, GL_UNSIGNED_BYTE, frame->data[2]);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, V_pbo_ids[current_pbo]);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, frame->width / 2, frame->height / 2, GL_RED, GL_UNSIGNED_BYTE, 0);
 
-    // Reset UNPACK_ROW_LENGTH to zero for standard behavior
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    // Unbind PBO and check for errors
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    checkGLError("glTexSubImage2D (PBO Transfer)");
+
+    // Flip the index for the next frame's operation
+    pbo_index = current_pbo;
 }
-
 void render() {
     glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -373,6 +488,7 @@ int main() {
 
 cleanup_and_exit:
     // Cleanup
+	cleanup_pbo();
     av_frame_free(&video_frame);
     cleanup_ffmpeg();
     glfwTerminate();
