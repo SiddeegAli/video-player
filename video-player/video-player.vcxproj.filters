@@ -18,7 +18,7 @@
     <ClCompile Include="src\main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\decode_video_frame.cpp">
+    <ClCompile Include="src\decode_video.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

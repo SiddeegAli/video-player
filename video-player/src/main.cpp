@@ -1,13 +1,20 @@
 #include <stdio.h>
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
-
+#include <thread>
 extern "C" {
 #include<libavformat/avformat.h>
+#include <chrono>
+
 }
 
-int decode_video_frame(const char* file_name, AVFrame** out_video_frame);
+// Declaring the functions that are in decode_video
+// NOTE: Modified signature to include 'double* pts_out'
+int init_ffmpeg(const char* file_name, int* w, int* h, double* frame_delay_out, AVFrame** frame);
+int get_next_frame(AVFrame** frame, double* pts_out);
+void cleanup_ffmpeg();
 
+// Global vars used
 int v_frame_width;
 int v_frame_height;
 
@@ -17,6 +24,8 @@ unsigned int V_txt;
 
 unsigned int shader_program;
 unsigned int VAO;
+
+// ... (vertexShaderSource and fragmentShaderSource remain unchanged) ...
 
 const char* vertexShaderSource = R"(
 #version 330 core
@@ -55,10 +64,6 @@ void main()
     V = V - 0.5;
 
     // YUV to RGB Conversion Matrix (BT.709 approximation, full range)
-    // R = Y + 1.5748 * V
-    // G = Y - 0.1873 * U - 0.4681 * V
-    // B = Y + 1.8556 * U
-
     float R = Y + 1.5748 * V;
     float G = Y - 0.1873 * U - 0.4681 * V;
     float B = Y + 1.8556 * U;
@@ -67,6 +72,9 @@ void main()
     FragColor = vec4(R, G, B, 1.0);
 }
 )";
+
+
+// ... (compileShader, createShaderProgram, setupYUVTextures, setupQuad, and updateYUVTexturesFromAVFrame remain unchanged) ...
 
 unsigned int compileShader(int type, const char* source) {
     //Createing and compileing the shader
@@ -242,46 +250,42 @@ void render() {
 }
 
 int main() {
-	fprintf(stdout , "FFmpeg C++ Video Player\n");
+    fprintf(stdout, "FFmpeg C++ Video Player\n");
 
-    //Createing a video frame and giving vlaue from the decode_video_frame function see decode_video_frame.cpp for more info
-	AVFrame* video_frame;
-	int ret = decode_video_frame("C:\\Users\\meyzat11\\source\\repos\\video-player\\x64\\Debug\\toubun no Hanayome Movie.mp4", &video_frame);
-	
+    //Createing a video frame placeholder
+    AVFrame* video_frame = nullptr;
+    // frame_delay is now only for logging the estimated FPS, not for timing
+    double estimated_frame_delay = 0.0;
+
+    // Init FFmpeg and get frame resolution
+    int ret = init_ffmpeg("C:\\Users\\meyzat11\\source\\repos\\video-player\\x64\\Debug\\test.mp4", &v_frame_width, &v_frame_height, &estimated_frame_delay, &video_frame);
+
     //Error handling
-	if (ret < 0) {
-		fprintf(stderr, "Failed to decode video frame\n");
-		av_frame_free(&video_frame);
-		return ret;
-	}
+    if (ret < 0) {
+        fprintf(stderr, "Failed to Init ffmpeg\n");
+        return ret;
+    }
 
-	fprintf(stdout, "Video frame decoded successfully\n");
-
-	//print the videos resolution
-	fprintf(stdout, "Video Resolution: %dx%d\n", video_frame->width, video_frame->height);
+    fprintf(stdout, "FFmpeg inited successfully\n");
 
     //Crateing a window and initing GLFW 
-	GLFWwindow* window;
-	if (!glfwInit())
-		return -2;
+    GLFWwindow* window;
+    if (!glfwInit())
+        return -2;
 
-	window = glfwCreateWindow(800, 600, "Test", nullptr, nullptr);
-	glfwMakeContextCurrent(window);
-	glViewport(0, 0, 800, 600);
+    window = glfwCreateWindow(800, 600, "Test", nullptr, nullptr);
+    glfwMakeContextCurrent(window);
+    glViewport(0, 0, 800, 600);
 
     //Ininting glew
-	if (glewInit() != GLEW_OK)
-		return -1;
-
-    //Setting are global vars to give them value
-	v_frame_width = video_frame->width;
-	v_frame_height = video_frame->height;
+    if (glewInit() != GLEW_OK)
+        return -1;
 
     //This function allows opengl to be aware if the windows size was changed by the user
-	glfwSetFramebufferSizeCallback(window, [](GLFWwindow* w, int width, int height) { glViewport(0, 0, width, height); });
+    glfwSetFramebufferSizeCallback(window, [](GLFWwindow* w, int width, int height) { glViewport(0, 0, width, height); });
 
     //Createing a shader to render the frame using
-	shader_program = createShaderProgram(vertexShaderSource, fragmentShaderSource);
+    shader_program = createShaderProgram(vertexShaderSource, fragmentShaderSource);
 
     if (shader_program == 0) {
         fprintf(stderr, "Couldent create a program");
@@ -297,19 +301,80 @@ int main() {
     glUniform1i(glGetUniformLocation(shader_program, "U_tex"), 1); // Texture unit 1
     glUniform1i(glGetUniformLocation(shader_program, "V_tex"), 2); // Texture unit 2
 
+    // Master Clock: Stores the time when the video started playing relative to its first frame's PTS
+    double video_start_time = -1.0;
 
-	while (!glfwWindowShouldClose(window)) {
+    // A reasonable threshold to decide if a frame is too old and should be dropped (e.g., 2 frames worth of delay)
+    const double MAX_CATCHUP_DELAY = 0.08;
 
-        //now all that is left is to start decodeing new frames
+    while (!glfwWindowShouldClose(window)) {
+        double frame_pts_seconds = 0.0;
+        int ret;
+
+        // --- 1. Frame Retrieval Loop & Frame Dropping ---
+        // Continuously decode frames until we get one that isn't too stale.
+        while (true) {
+            ret = get_next_frame(&video_frame, &frame_pts_seconds);
+
+            if (ret < 0) {
+                if (ret != AVERROR_EOF) {
+                    fprintf(stderr, "Critical error during decoding. Stopping playback.\n");
+                }
+                goto cleanup_and_exit;
+            }
+
+            double master_clock = glfwGetTime();
+
+            // Initialize the video start time on the very first frame
+            if (video_start_time < 0.0) {
+                // video_start_time = SystemTime (master_clock) - FramePTS
+                // This establishes a sync point: when the first frame (at its PTS) *should* be shown.
+                video_start_time = master_clock - frame_pts_seconds;
+            }
+
+            // Calculate the intended time this frame *should* appear on screen.
+            double intended_render_time = frame_pts_seconds + video_start_time;
+
+            // Calculate how much time is left until the intended render time.
+            double time_to_render = intended_render_time - master_clock;
+
+            // If the frame is too late (stale), drop it and continue the loop to get the next one.
+            if (time_to_render < -MAX_CATCHUP_DELAY) {
+                // The -MAX_CATCHUP_DELAY ensures we drop frames only if we're behind by more than 2 frames worth of time (0.08s).
+                fprintf(stderr, "Dropping stale frame (PTS: %.3fs, Clock: %.3fs). Need to catch up.\n", frame_pts_seconds, master_clock);
+                continue; // Loop back and decode the next frame immediately.
+            }
+
+            // We have a frame that is either early or only slightly late/on time.
+            break; // Exit the retrieval loop to process and render this frame.
+        }
+
+        // The current frame (video_frame) is the one we will present.
+
+        // --- 2. Synchronization Wait (Blocking Sleep) ---
+        // Recalculate time_to_render, as decoding/dropping took time.
+        double current_master_clock = glfwGetTime();
+        double intended_render_time = frame_pts_seconds + video_start_time;
+        double time_to_wait = intended_render_time - current_master_clock;
+
+        if (time_to_wait > 0.0) {
+            // Frame is early: sleep for the remainder.
+            auto remaining_sleep = std::chrono::duration<double>(time_to_wait);
+            std::this_thread::sleep_for(remaining_sleep);
+        }
+
+        // --- 3. Render ---
         updateYUVTexturesFromAVFrame(video_frame);
         render();
 
-		glfwSwapBuffers(window);
-		glfwPollEvents();
-	}
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
 
-	// Free the allocated frame
-	av_frame_free(&video_frame);
-	glfwTerminate();
-	return 0;
+cleanup_and_exit:
+    // Cleanup
+    av_frame_free(&video_frame);
+    cleanup_ffmpeg();
+    glfwTerminate();
+    return 0;
 }
